@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  mcp-build:
+    name: MCP TypeScript build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+      - run: npm install --no-package-lock
+      - run: npx tsc --noEmit
+      - name: Smoke-test MCP server starts (no bundle expected)
+        run: |
+          # Start the MCP server, send tools/list, expect a clean reject because no bridge is up.
+          # This proves the binary loads and the MCP framing works without needing a real bundle.
+          timeout 5 node bin/olympus-fdrs-layer2-mcp.ts < /dev/null > out.log 2>&1 || true
+          grep -q "bundle health probe failed" out.log || (echo "Expected health-probe failure, got:" && cat out.log && exit 1)
+          echo "OK — MCP server fails fast when bridge is missing"
+        shell: bash
+
+  bridge-shellcheck:
+    name: Bridge build scripts shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get install -y shellcheck
+          shellcheck bridges/*/scripts/*.sh

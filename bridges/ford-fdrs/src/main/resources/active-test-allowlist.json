@@ -1,0 +1,6 @@
+{
+  "_comment": "Active-test routine allow-list. Each key is the publicName of a registered ActiveTestAdapter. Empty list = no routines wired (PR#E scaffolding state). Per-routine PRs each add ONE key with its safety-case document cross-referenced. See docs/fdrs-layer2/active-test-safety-case-v1.md for the 5-gate template.",
+  "_safetyCaseDoc": "backend/docs/fdrs-layer2/active-test-safety-case-v1.md",
+  "_addRoutinePR": "Each per-routine PR MUST: (1) add a key here referencing the adapter's publicName, (2) add a §2.N subsection to the safety-case doc covering the 5 gates for that routine, (3) land Session K review + Session E sign-off.",
+  "allowed": {}
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@futureai/olympus-oem-bridge-mcp",
+  "version": "0.1.0",
+  "description": "MCP server wrapping OEM diagnostic bridges. Reference impl: Ford FDRS via the Layer 2 OSGi bundle.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FutureAI-global/olympus-oem-bridge.git",
+    "directory": "mcp"
+  },
+  "main": "dist/src/mcp-server.js",
+  "bin": {
+    "olympus-fdrs-layer2-mcp": "dist/bin/olympus-fdrs-layer2-mcp.js"
+  },
+  "files": ["dist", "src", "bin"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node bin/olympus-fdrs-layer2-mcp.js",
+    "smoke": "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | node dist/bin/olympus-fdrs-layer2-mcp.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
