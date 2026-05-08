@@ -2,6 +2,15 @@
 
 Skeleton for a new OEM diagnostic bridge. Copy this directory to `bridges/<your-oem-name>/` and fill in the blanks.
 
+## Files
+
+| File | Purpose |
+|---|---|
+| [`bridge.py`](./bridge.py) | Reference Python skeleton — full HTTP protocol, allowlist, error handling. Replace the four `MARK:` blocks with your OEM-specific code. Stdlib-only (no external deps). |
+| `README.md` (this) | Walkthrough |
+
+The Python skeleton is the easiest starting point even if your OEM tool doesn't run Python — you can use it as a sidecar process that talks to the OEM tool over IPC, named pipes, or a local socket. For OEM tools that require in-process loading (OSGi bundles, .NET assemblies), study [`bridges/ford-fdrs/`](../ford-fdrs/) for the OSGi reference impl and adapt the same shape to your runtime.
+
 ## What you're building
 
 A small piece of code that:

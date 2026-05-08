@@ -7,7 +7,7 @@ on:
 
 jobs:
   mcp-build:
-    name: MCP TypeScript build
+    name: MCP TypeScript build + smoke
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -17,24 +17,77 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: mcp/package-lock.json
-      - run: npm install --no-package-lock
-      - run: npx tsc --noEmit
-      - name: Smoke-test MCP server starts (no bundle expected)
+      - name: Install deps
+        run: npm install
+      - name: Type-check
+        run: npx tsc --noEmit
+      - name: Build dist/
+        run: npm run build
+      - name: Smoke — launcher fails fast when bundle is missing
         run: |
-          # Start the MCP server, send tools/list, expect a clean reject because no bridge is up.
-          # This proves the binary loads and the MCP framing works without needing a real bundle.
-          timeout 5 node bin/olympus-fdrs-layer2-mcp.ts < /dev/null > out.log 2>&1 || true
-          grep -q "bundle health probe failed" out.log || (echo "Expected health-probe failure, got:" && cat out.log && exit 1)
-          echo "OK — MCP server fails fast when bridge is missing"
-        shell: bash
+          # FDRS bundle is not running in CI. The launcher should exit
+          # with code 2 and print the expected error — proving the binary
+          # loads, the MCP framing initializes, and the health probe runs.
+          set +e
+          FDRS_LAYER2_TIMEOUT_MS=1500 \
+            timeout 5 node dist/bin/olympus-fdrs-layer2-mcp.js < /dev/null > out.log 2>&1
+          EXIT=$?
+          set -e
+          echo "exit=$EXIT"
+          cat out.log
+          if [ "$EXIT" != "2" ]; then
+            echo "expected exit 2 (health probe fail), got $EXIT"
+            exit 1
+          fi
+          if ! grep -q "bundle health probe failed" out.log; then
+            echo "expected 'bundle health probe failed' in stderr, got:"
+            cat out.log
+            exit 1
+          fi
+          echo "OK — launcher fails fast as designed"
 
   bridge-shellcheck:
     name: Bridge build scripts shellcheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          sudo apt-get install -y shellcheck
-          shellcheck bridges/*/scripts/*.sh
+      - name: Install shellcheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: |
+          for f in bridges/*/scripts/*.sh; do
+            echo "=== $f ==="
+            shellcheck -x "$f" || exit 1
+          done
+
+  link-check:
+    name: Doc link integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify internal cross-references
+        run: |
+          # All ./ relative links in docs/ + READMEs must resolve to existing paths.
+          # Prevents broken-link rot as the repo evolves.
+          set -e
+          fails=0
+          for md in $(find . -name '*.md' -not -path './node_modules/*'); do
+            dir=$(dirname "$md")
+            for link in $(grep -oE '\]\((\./|\.\./|/)[^)]+' "$md" | sed 's/^](//' | sed 's/#.*//' | sort -u); do
+              # Strip leading slash from absolute repo-relative links
+              if [[ "$link" == /* ]]; then
+                target=".$link"
+              else
+                target="$dir/$link"
+              fi
+              if [ ! -e "$target" ]; then
+                echo "BROKEN: $md references missing $target (raw: $link)"
+                fails=$((fails+1))
+              fi
+            done
+          done
+          if [ $fails -gt 0 ]; then
+            echo "$fails broken link(s) found"
+            exit 1
+          fi
+          echo "all links resolve"

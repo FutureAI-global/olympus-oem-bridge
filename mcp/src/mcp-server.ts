@@ -84,25 +84,25 @@ export interface BuildLayer2McpServerOpts {
 
 const TOOL_DESCRIPTIONS: Record<Layer2McpToolName, string> = {
   module_inventory:
-    "List vehicle control modules with FDRS badge state (green/orange/red). Maps to bundle command getApplicationsAndSystems. Returns 47-114 modules typical for current Ford vehicles. Pass freshOnly:true to bypass the bundle's cached snapshot and force a live UDS sweep (slower, 10-30s, but ground truth per MUST-31). Default false returns cached badge state which is fast but may be minutes-to-hours stale.",
+    "List vehicle control modules with the OEM tool's badge state (typically green/orange/red). Maps to bundle command getApplicationsAndSystems. Returns the full OSGi response tree (complexTools, systems, moduleNeutralApplications). Pass freshOnly:true to request a live UDS sweep instead of the bundle's cached snapshot (slower, 10-30s, but ground truth). Default false returns cached badge state which is fast but may be minutes-to-hours stale.",
   self_test:
-    "Read stored DTCs from a specific module via UDS service 0x19 self-test. Maps to bundle command readSelfTestDTCs. Forces a live UDS read when forceRefresh:true (default false uses bundle's cached snapshot from prior FDRS click).",
+    "Read stored DTCs from a specific module via UDS service 0x19 self-test. Maps to bundle command readSelfTestDTCs. Forces a live UDS read when forceRefresh:true (default false uses the bundle's cached snapshot from a prior diagnostic-tool query).",
   vehicle_history:
-    "Read the vehicle's CDL (Common Diagnostic Logger) history events. Maps to bundle command readVehicleHistory. Used by phase-8 Anticipatory diagnostics for context on prior repairs.",
+    "Read the vehicle's CDL (Common Diagnostic Logger) history events. Maps to bundle command readVehicleHistory. Useful for context on prior repairs and recurring symptoms.",
   vehicle_status:
-    "Probe the FDRS bundle's view of the connected vehicle (connection state, current VIN, ignition status, VCM3 link health). Maps to bundle command getVehicleModelStatus. Cheap (~10ms) — call before any other dispatch to verify FDRS still has the vehicle.",
+    "Probe the bundle's view of the connected vehicle (connection state, current VIN, ignition status, pass-thru link health). Maps to bundle command getVehicleModelStatus. Cheap (~10ms). Call before any other dispatch to verify the OEM tool still has the vehicle.",
   last_vehicles:
-    "List recently-selected vehicles from FDRS's session memory. Maps to bundle command getLastSelectedVehicles. Used to recover state after a tech disconnects mid-session.",
+    "List recently-selected vehicles from the OEM tool's session memory. Maps to bundle command getLastSelectedVehicles. Useful to recover state after a session interruption.",
   bridge_health:
-    "Probe the Layer 2 bundle itself (not a vehicle command). Returns bundleVersion, invokerAvailable, commandsExposed. Use to verify the OSGi bundle is loaded inside FDRS's Felix container before dispatching commands.",
+    "Probe the bridge itself (not a vehicle command). Returns bundleVersion, invokerAvailable, commandsExposed. Use to verify the bridge is loaded inside the OEM tool's runtime before dispatching commands.",
   bridge_commands:
-    "List all OSGi commands the bundle exposes via its allowlist. Maps to GET /commands. Useful for introspection during bundle rollout — confirms an expected command name is exposed before Olympus tries to invoke it.",
+    "List all commands the bridge exposes via its allowlist. Maps to GET /commands. Useful for introspection — confirms an expected command name is exposed before invoking it.",
   read_did:
-    "Read a single UDS Data Identifier (DID) from a specific module via UDS service 0x22. Maps to bundle command readDID. Returns subfields (name, dataType, unit, hexValue, convertedValue). Triggers real bus I/O — runner gates this as 'confirm' tier. Typical Ford DIDs: 0xF190=VIN, 0xF1A2=ASBuilt strategy, 0xF111=cal part number, 0x1E50=throttle position, 0x1E41=engine RPM. nodeAddress accepts decimal or hex string ('0x760' for PCM, '0x727' for BCM, '0x733' for ABS).",
+    "Read a single UDS Data Identifier (DID) from a specific module via UDS service 0x22. Maps to bundle command readDID. Returns subfields (name, dataType, unit, hexValue, convertedValue). Triggers real bus I/O — consumers should treat as 'confirm' tier (require user approval before dispatch). Typical Ford DIDs: 0xF190=VIN, 0xF1A2=ASBuilt strategy, 0xF111=cal part number, 0x1E50=throttle position, 0x1E41=engine RPM. nodeAddress accepts decimal or hex string ('0x760' for PCM, '0x727' for BCM, '0x733' for ABS).",
   read_did_batch:
     "Read multiple UDS DIDs from a single module in one call (serial reads under the hood). Maps to bundle command readDIDBatch. More efficient than N separate read_did calls because the bundle reuses a single bus session. Use when displaying a snapshot of related parameters (e.g. all engine PIDs for a triage view).",
   stream_pid_window:
-    `Continuously read a single DID from a module for a bounded window, returning the full sample array. Polls read_did internally at the requested rate. Bounds enforced: durationSec <= ${STREAM_PID_LIMITS.maxDurationSec}, ${STREAM_PID_LIMITS.minRateHz} <= rateHz <= ${STREAM_PID_LIMITS.maxRateHz}, total samples <= ${STREAM_PID_LIMITS.maxSamples}. Use to observe dynamic state (EGR position cycling, fuel-trim drift, RPM-correlated faults). Synchronous: response arrives after the window completes; for live streaming, use a future read_did_subscribe tool (not yet implemented).`,
+    `Continuously read a single DID from a module for a bounded window, returning the full sample array. Polls read_did internally at the requested rate. Bounds enforced: durationSec <= ${STREAM_PID_LIMITS.maxDurationSec}, ${STREAM_PID_LIMITS.minRateHz} <= rateHz <= ${STREAM_PID_LIMITS.maxRateHz}, total samples <= ${STREAM_PID_LIMITS.maxSamples}. Use to observe dynamic state (EGR position cycling, fuel-trim drift, RPM-correlated faults). Synchronous: response arrives after the window completes.`,
 };
 
 const TOOL_INPUT_SCHEMAS: Record<Layer2McpToolName, Tool["inputSchema"]> = {
@@ -118,7 +118,7 @@ const TOOL_INPUT_SCHEMAS: Record<Layer2McpToolName, Tool["inputSchema"]> = {
         type: "boolean",
         default: false,
         description:
-          "When true, request a live UDS sweep (bypass the bundle's cached badge state). Maps to forceRefresh on the bundle command. Honest accounting per MUST-31: when freshOnly:true is passed but the bundle does not honor it (older JAR versions ignore the arg), the response payload's source field will read 'unknown' rather than 'live-uds' to avoid lying about freshness.",
+          "When true, request a live UDS sweep (bypass the bundle's cached badge state). Maps to forceRefresh on the bundle command. Older bundle versions may silently ignore this arg; the response payload's requestedFresh field surfaces what the caller asked for so consumers can detect when freshness was requested but not honored.",
       },
     },
     required: ["vin"],
@@ -136,7 +136,7 @@ const TOOL_INPUT_SCHEMAS: Record<Layer2McpToolName, Tool["inputSchema"]> = {
         type: "boolean",
         default: false,
         description:
-          "Force a live UDS 0x19 read instead of returning the bundle's cached badge state. Maps to bundle arg forceRefresh — TRUE escalates to confirm-tier per the tool-authority manifest.",
+          "Force a live UDS 0x19 read instead of returning the bundle's cached badge state. Maps to bundle arg forceRefresh. Consumers should treat forceRefresh:true as confirm-tier even though the tool itself is auto-tier — the live-bus dispatch is what warrants confirmation.",
       },
     },
     required: ["vin", "module"],

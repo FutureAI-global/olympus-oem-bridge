@@ -5,7 +5,7 @@ import type {
   Layer2HealthResponse,
   Layer2InvokeResult,
   Layer2ListCommandsResponse,
-} from "./types";
+} from "./types.js";
 
 export class Layer2Error extends Error {
   readonly kind: "timeout" | "network" | "protocol";
