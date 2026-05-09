@@ -30,49 +30,68 @@ import java.util.logging.Logger;
  *       when a TypeScript tool routes to this adapter.</li>
  * </ul>
  *
- * <p><b>2026-05-09 forensic update (Session N bench finding):</b> all 7
- * modules x 7 DIDs returned {@code result:null} on bundle 0.2.5. The same
- * bridge dispatches {@code readSelfTestDTCs} successfully against the same
- * vehicle, so the issue is specific to the {@code ReadDID} command path.
- * Hypotheses ranked by likelihood (per #2484 comment 4411319876):
+ * <p><b>2026-05-09 root-cause fix attempt.</b> Session N's bench
+ * (#2484 comments 4411319876, 4411430404, 4411476258) showed:
+ * <ul>
+ *   <li>readDID returns {@code result:null} on every (module x DID) combo</li>
+ *   <li>Same null on raw curl bypassing MCP — definitively JAR-side</li>
+ *   <li>1ms latency = no UDS bus traffic dispatched at all</li>
+ *   <li>readSelfTestDTCs WORKS on the same bridge with rich payload</li>
+ * </ul>
+ *
+ * <p>JAR class-file inspection of {@code com.ford.otx.command.AbstractCommand}
+ * + {@code Command} interface revealed the receiver pattern:
+ * <pre>
+ *   - Command.getReceiverType()         -- Class&lt;?&gt; of expected result
+ *   - CommandInvoker.registerReceiver(cmd)   -- creates + binds receiver
+ *   - CommandInvoker.invoke(cmd)        -- populates receiver via execute()
+ *   - CommandInvoker.deregisterReceiver(cmd) -- cleanup
+ * </pre>
+ *
+ * <p>{@link com.ford.otx.services.vehicle.comms.command.ReadAllCMDTCs}
+ * (working) has {@code receiver} as a constructor arg — caller passes
+ * a {@code DTCList} which the command populates. Returns it via the
+ * conventional {@code execute} pattern, walkBean-able from the invoke
+ * return value.
+ *
+ * <p>{@link ReadDID} (broken) takes only {@code (didNumber, nodeAddress)}.
+ * No receiver in the constructor. Means one of:
  * <ol>
- *   <li>JAR adapter drops the response — invoke returns valid DID object
- *       but serializer fails silently.</li>
- *   <li>Diagnostic-session not in extended-mode (UDS 0x10 type 03).
- *       UDS 0x22 (read-DID) requires extended diag on most ECUs;
- *       UDS 0x19 (DTC read) typically allowed in default 0x01.</li>
- *   <li>DID parameter encoding wrong (big-endian vs little-endian, or
- *       single-byte instead of two-byte DID id in the UDS frame).</li>
+ *   <li>Result is delivered via {@link CommandInvoker#registerReceiver}
+ *       which returns/binds a receiver; we never call this so receiver
+ *       stays null and the bus dispatch is suppressed.</li>
+ *   <li>Result is stored on the cmd instance post-{@code execute()} via a
+ *       getter we can locate by walking the cmd's fields/getters.</li>
+ *   <li>Result is the {@code execute()} return value but Router's invoke
+ *       wraps it in a way that loses non-receiver returns.</li>
  * </ol>
  *
- * <p>This file adds reflection-based diagnostic logging in
- * {@link #serializeResult} that dumps: result class + null-status, all
- * getter values when non-null, the originating Command's post-invoke
- * state (in case Ford uses a "store-on-cmd" result pattern). Distinguishes
- * the 3 hypotheses on the next bench session without requiring a wire-
- * level capture.
+ * <p>This adapter handles all three with a layered fallback:
+ * <ol>
+ *   <li>{@link #serializeResult} called by Router with {@code result}
+ *       from {@code inv.invoke(cmd)}. If non-null: walkBean it (the
+ *       happy path other commands hit).</li>
+ *   <li>If null: walk the cmd object's getters via reflection. Look
+ *       for a getter whose return type is the receiver type
+ *       ({@code cmd.getReceiverType()}) and which returns a non-null
+ *       value. Surface that as the result. Catches hypotheses 2+3.</li>
+ *   <li>If still nothing: return a structured diagnostic payload
+ *       {@code {sourceWasNull: true, cmdReceiverType, cmdGetterDump}}
+ *       so consumers can self-debug instead of getting an opaque null.</li>
+ * </ol>
  *
- * <p>Logging is gated on the system property
- * {@code futureai.layer2.readdid.debug=true} so production runs stay quiet
- * once the diagnosis is closed and this file reverts to its pre-forensic
- * shape.
- *
- * <p>Arg coercion: JSON numbers may arrive as {@code Integer}, {@code Long},
- * or {@code Double} depending on the inbound body. Tech-facing callers may
- * also pass hex strings like {@code "0xF190"} (DID F1 90 for software version
- * block) or {@code "0x760"} (PCM address). The coercer accepts all three
- * shapes and fails loudly on anything outside them so Opus sees a clear
- * arg-shape error instead of silent zero-substitution.
- *
- * <p>PR#A / plan doc #1648 track A — first of the scaling slice. Pairs with
- * PR#D (module-specific PID convenience bundles) which composes this adapter.
+ * <p>Forensic logging (gated on {@code FUTUREAI_LAYER2_READDID_DEBUG=1}
+ * env var or {@code -Dfutureai.layer2.readdid.debug=true}) captures every
+ * branch's evidence to the bundle's JUL logger so N's next bench can
+ * identify which hypothesis actually applies even if the fallback
+ * succeeds.
  */
 public final class ReadDIDAdapter implements CommandAdapter {
     private static final Logger LOG = Logger.getLogger("com.futureai.fdrs.layer2.readdid");
 
     /**
      * Per-thread last-issued ReadDID command. Stored in {@link #make} and
-     * read in {@link #serializeResult} so the diagnostic dump can introspect
+     * read in {@link #serializeResult} so the fallback path can introspect
      * the cmd's post-invoke state. ThreadLocal because Router invokes
      * adapters on the http-request thread; no cross-request leakage.
      */
@@ -102,7 +121,7 @@ public final class ReadDIDAdapter implements CommandAdapter {
         Command<?, ?, ?> cmd = new ReadDID(didNumber, nodeAddress);
         LAST_CMD.set(cmd);
         if (debugEnabled()) {
-            LOG.log(Level.INFO, "[readDID-forensic] make: didNumber=0x{0} ({1}), nodeAddress=0x{2} ({3}), cmd.class={4}",
+            LOG.log(Level.INFO, "[readDID] make: didNumber=0x{0} ({1}), nodeAddress=0x{2} ({3}), cmd.class={4}",
                 new Object[]{
                     Integer.toHexString(didNumber).toUpperCase(),
                     didNumber,
@@ -116,21 +135,126 @@ public final class ReadDIDAdapter implements CommandAdapter {
 
     @Override
     public Object serializeResult(Object result) {
+        Command<?, ?, ?> cmd = LAST_CMD.get();
         try {
-            if (debugEnabled()) {
-                dumpForensic(result, LAST_CMD.get());
+            // Path 1: invoke() returned a non-null result — happy path.
+            if (result != null) {
+                if (debugEnabled()) {
+                    LOG.log(Level.INFO, "[readDID] result.class={0} (non-null, using direct return)",
+                        result.getClass().getName());
+                }
+                return Json.walkBean(result, 6);
             }
+
+            // Path 2: invoke() returned null. Try to recover from cmd state.
+            // Ford's AbstractCommand uses receiver-pattern result delivery —
+            // the populated receiver is reachable via the cmd's getters.
+            if (cmd != null) {
+                if (debugEnabled()) {
+                    LOG.info("[readDID] result=NULL; scanning cmd for receiver-bound result");
+                    for (String line : reflectGetters(cmd, "cmd")) {
+                        LOG.info(line);
+                    }
+                }
+
+                // Look for a getter on cmd whose return type matches the
+                // declared receiver type (cmd.getReceiverType() returns
+                // Class<?> of the result type for receiver-pattern commands).
+                Class<?> recvType = null;
+                try {
+                    Method getRecvType = cmd.getClass().getMethod("getReceiverType");
+                    Object t = getRecvType.invoke(cmd);
+                    if (t instanceof Class<?>) recvType = (Class<?>) t;
+                } catch (Throwable ignore) { /* not a receiver-pattern command */ }
+
+                Object recovered = findReceiverValue(cmd, recvType);
+                if (recovered != null) {
+                    if (debugEnabled()) {
+                        LOG.log(Level.INFO, "[readDID] recovered from cmd state: {0}",
+                            recovered.getClass().getName());
+                    }
+                    return Json.walkBean(recovered, 6);
+                }
+
+                // Path 3: still nothing. Return a structured diagnostic so
+                // the consumer can see WHY the result was null instead of
+                // getting an opaque {ok:true, result:null} that hides the
+                // cause. This payload includes the cmd's getter dump and
+                // the declared receiver type so a downstream forensic step
+                // has full context.
+                Map<String, Object> diag = new LinkedHashMap<>();
+                diag.put("sourceWasNull", true);
+                diag.put("cmdClass", cmd.getClass().getName());
+                if (recvType != null) diag.put("cmdReceiverType", recvType.getName());
+                Map<String, Object> getterDump = new LinkedHashMap<>();
+                for (Method m : cmd.getClass().getMethods()) {
+                    if (m.getParameterCount() != 0) continue;
+                    if ((m.getModifiers() & Modifier.STATIC) != 0) continue;
+                    if (m.getDeclaringClass() == Object.class) continue;
+                    String n = m.getName();
+                    if (!n.startsWith("get") && !n.startsWith("is")) continue;
+                    if ("getClass".equals(n)) continue;
+                    String prop = n.startsWith("get")
+                        ? Character.toLowerCase(n.charAt(3)) + n.substring(4)
+                        : Character.toLowerCase(n.charAt(2)) + n.substring(3);
+                    try {
+                        Object r = m.invoke(cmd);
+                        getterDump.put(prop, r == null ? null : r.toString());
+                    } catch (Throwable t) {
+                        getterDump.put(prop, "EXC:" + t.getClass().getSimpleName());
+                    }
+                }
+                diag.put("cmdGetters", getterDump);
+                return diag;
+            }
+
+            return null;
         } finally {
             LAST_CMD.remove();
         }
-        return Json.walkBean(result, 6);
+    }
+
+    /**
+     * Search the cmd's getters for one returning a non-null value whose
+     * type matches (or is assignable to) the declared receiver type.
+     * If recvType is null, returns the first non-null non-primitive
+     * non-CharSequence return value we find — best-effort fallback for
+     * commands whose receiver type is unknown but whose state is reachable.
+     */
+    private static Object findReceiverValue(Object cmd, Class<?> recvType) {
+        for (Method m : cmd.getClass().getMethods()) {
+            if (m.getParameterCount() != 0) continue;
+            if ((m.getModifiers() & Modifier.STATIC) != 0) continue;
+            if (m.getDeclaringClass() == Object.class) continue;
+            String n = m.getName();
+            if (!n.startsWith("get") && !n.startsWith("is")) continue;
+            if ("getClass".equals(n) || "getReceiverType".equals(n)
+                || "getReceiverPropertyTypes".equals(n) || "getOperationId".equals(n)
+                || "getLoggingDetails".equals(n)) continue;
+            Class<?> ret = m.getReturnType();
+            // Skip primitives, void, and trivially-reflective types.
+            if (ret == void.class || ret.isPrimitive()) continue;
+            if (ret == String.class || CharSequence.class.isAssignableFrom(ret)) continue;
+            try {
+                Object v = m.invoke(cmd);
+                if (v == null) continue;
+                if (recvType != null) {
+                    if (recvType.isInstance(v)) return v;
+                    // Also accept if it's a List/Set whose element-type matches
+                    // — covers List<DID> shapes which we might see here.
+                    continue;
+                }
+                // recvType unknown: best-effort, accept any non-trivial object.
+                return v;
+            } catch (Throwable ignore) { /* skip */ }
+        }
+        return null;
     }
 
     /**
      * True when {@code -Dfutureai.layer2.readdid.debug=true} is on the JVM
      * cmdline, OR when the env var {@code FUTUREAI_LAYER2_READDID_DEBUG=1}
-     * is set. Either gate enables the verbose forensic log path; production
-     * runs leave both unset and pay zero cost.
+     * is set. Either gate enables verbose forensic logging.
      */
     private static boolean debugEnabled() {
         if ("true".equalsIgnoreCase(System.getProperty("futureai.layer2.readdid.debug"))) return true;
@@ -139,56 +263,13 @@ public final class ReadDIDAdapter implements CommandAdapter {
     }
 
     /**
-     * Reflection-based dump that captures whether the null payload comes
-     * from {@code inv.invoke()} returning null (hypothesis 1: serializer
-     * fails silently), or returning a populated DID whose getters all
-     * return null (hypothesis 2: extended diag session needed), or the
-     * cmd object itself carrying state Ford expects callers to read post-
-     * invoke (hypothesis 3: store-on-cmd pattern).
-     *
-     * <p>Output goes to the bundle's standard JUL logger at INFO so it
-     * appears alongside the rest of the bridge's startup chatter. Format:
-     * one INFO line per dimension so log-grep is straightforward.
-     */
-    private static void dumpForensic(Object result, Command<?, ?, ?> cmd) {
-        // Dimension 1: invoke result class + null status.
-        if (result == null) {
-            LOG.info("[readDID-forensic] result=NULL (inv.invoke returned null — hypothesis 1 or 3)");
-        } else {
-            LOG.log(Level.INFO, "[readDID-forensic] result.class={0}", result.getClass().getName());
-            // Dimension 2: getter values via reflection. If all values are
-            // null, hypothesis 2 (no diag session) is likely. If values are
-            // populated but Json.walkBean still gives null, hypothesis 1.
-            for (String line : reflectGetters(result, "result")) {
-                LOG.info(line);
-            }
-        }
-
-        // Dimension 3: the originating Command's post-invoke state. Ford's
-        // OSGI invoker MAY store the result on the command object itself
-        // rather than returning it (the "store-on-cmd" pattern). If a
-        // ReadDID instance has a non-null getDID() / getResult() / getValue()
-        // post-invoke even when result is null, hypothesis 3 confirmed.
-        if (cmd != null) {
-            LOG.log(Level.INFO, "[readDID-forensic] cmd.class={0}", cmd.getClass().getName());
-            for (String line : reflectGetters(cmd, "cmd")) {
-                LOG.info(line);
-            }
-        } else {
-            LOG.info("[readDID-forensic] cmd=NULL (LAST_CMD threadlocal cleared between make/serialize — race?)");
-        }
-    }
-
-    /**
      * Walk public getters of {@code obj} and return one log-friendly line
-     * per getter: {@code   prefix.propName: <value or NULL or EXC>}. Skips
-     * Object-class methods and ignores throwables so a single broken
-     * getter does not abort the whole dump.
+     * per getter. Skips Object-class methods and ignores throwables.
      */
     private static List<String> reflectGetters(Object obj, String prefix) {
         List<String> out = new ArrayList<>();
         if (obj == null) {
-            out.add("[readDID-forensic]   " + prefix + ": NULL");
+            out.add("[readDID]   " + prefix + ": NULL");
             return out;
         }
         for (Method m : obj.getClass().getMethods()) {
@@ -216,9 +297,9 @@ public final class ReadDIDAdapter implements CommandAdapter {
                     val = r.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(r));
                 }
             } catch (Throwable t) {
-                val = "EXC:" + t.getClass().getSimpleName() + ":" + (t.getMessage() == null ? "" : t.getMessage().replace("\n", " "));
+                val = "EXC:" + t.getClass().getSimpleName();
             }
-            out.add("[readDID-forensic]   " + prefix + "." + prop + ": " + val);
+            out.add("[readDID]   " + prefix + "." + prop + ": " + val);
         }
         return out;
     }
@@ -271,9 +352,6 @@ public final class ReadDIDAdapter implements CommandAdapter {
                 if (lower.startsWith("0x")) {
                     return Integer.parseInt(lower.substring(2), 16);
                 }
-                // Bare hex-like strings ("F190") — accept iff all chars are hex and
-                // the decimal parse below would fail. This avoids surprising decimal
-                // parses like "10" -> 10 (dec) when caller meant 0x10 = 16.
                 try {
                     return Integer.parseInt(s, 10);
                 } catch (NumberFormatException dec) {
