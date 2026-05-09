@@ -14,6 +14,9 @@ Import-Package: org.osgi.framework;version="[1.6,2.0)",
  com.ford.otx.services.user.command;version=0,
  com.ford.otx.services.vehicle.command;version=0,
  com.ford.otx.services.vehicle.comms.command;version=0,
- com.ford.etis.runtime.measurement.management.command;version=0
+ com.ford.otx.services.vehicle.comms;version=0,
+ com.ford.otx.services.vehicle.comms.model;version=0,
+ com.ford.etis.runtime.measurement.management.command;version=0,
+ com.ford.dsp.domain.vehicle.services;version=0,
+ com.ford.dsp.domain.vehicle.comms.exceptions;version=0
 Require-Capability: osgi.ee;filter:="(&(osgi.ee=JavaSE)(version>=1.8))"
-
