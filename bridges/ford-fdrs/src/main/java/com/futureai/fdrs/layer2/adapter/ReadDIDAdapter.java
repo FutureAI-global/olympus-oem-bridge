@@ -201,8 +201,21 @@ public final class ReadDIDAdapter implements CommandAdapter {
                             }
                             return Json.walkBean(directResult, 6);
                         }
+                        // v3: null return after real bus traffic (~975ms on N's bench) is
+                        // the signature of UDS 0x22 NRC because the ECU is in default
+                        // diagnostic session. Escalate to EXTENTED_SESSION via
+                        // DiagSessionCommand and retry. Reflection-based so the bundle
+                        // does not need new Import-Package entries for com.ford.dsp.domain.*.
+                        Object retryResult = retryWithExtendedSession(cmd, receiverService, execMethod);
+                        if (retryResult != null) {
+                            if (debugEnabled()) {
+                                LOG.log(Level.INFO, "[readDID] retry-with-extended-session returned: {0}",
+                                    retryResult.getClass().getName());
+                            }
+                            return Json.walkBean(retryResult, 6);
+                        }
                         if (debugEnabled()) {
-                            LOG.info("[readDID] cmd.execute(service) returned null; falling through");
+                            LOG.info("[readDID] cmd.execute(service) and retry both null; falling through");
                         }
                     } else if (debugEnabled()) {
                         LOG.info("[readDID] could not resolve receiver service from BundleContext; falling through");
@@ -282,6 +295,77 @@ public final class ReadDIDAdapter implements CommandAdapter {
             return null;
         } finally {
             LAST_CMD.remove();
+        }
+    }
+
+    /**
+     * v3: switch the target module to EXTENTED_SESSION (UDS 0x10 type 03)
+     * via Ford's DiagSessionCommand, then retry cmd.execute(receiverService).
+     * Uses reflection so the bundle manifest does not have to add Import-
+     * Package entries for com.ford.dsp.domain.vehicle.services.* — those
+     * classes are loaded at runtime from the Felix classpath when the
+     * bundle is already running inside FDRS.
+     *
+     * Returns the populated DID on success, null if any step in the
+     * session-escalation chain failed (in which case caller falls through
+     * to the structured diagnostic dump).
+     */
+    private static Object retryWithExtendedSession(Command<?, ?, ?> cmd, Object readDIDService, Method readDIDExecMethod) {
+        try {
+            // Resolve nodeAddress from cmd's private field — it was set
+            // by the constructor and is needed for addModuleForSessionRequest.
+            int nodeAddress;
+            try {
+                java.lang.reflect.Field naField = cmd.getClass().getDeclaredField("nodeAddress");
+                naField.setAccessible(true);
+                nodeAddress = naField.getInt(cmd);
+            } catch (Throwable t) {
+                if (debugEnabled()) LOG.log(Level.INFO, "[readDID] retry: could not read nodeAddress from cmd: {0}", t.getMessage());
+                return null;
+            }
+
+            // Look up SelftestService — the receiver for DiagSessionCommand.
+            Bridge bridge = Bridge.active();
+            if (bridge == null) return null;
+            BundleContext bctx = bridge.context();
+            if (bctx == null) return null;
+
+            String selftestSvcFqn = "com.ford.dsp.domain.vehicle.services.SelftestService";
+            ServiceReference<?> selftestRef = bctx.getServiceReference(selftestSvcFqn);
+            if (selftestRef == null) {
+                if (debugEnabled()) LOG.info("[readDID] retry: SelftestService not registered in BundleContext");
+                return null;
+            }
+            Object selftestSvc = bctx.getService(selftestRef);
+            if (selftestSvc == null) return null;
+
+            // Build DiagSessionCommand + addModuleForSessionRequest(nodeAddress, EXTENTED_SESSION).
+            Class<?> diagSessCmdClass = Class.forName("com.ford.dsp.domain.vehicle.services.DiagSessionCommand");
+            Object diagSessCmd = diagSessCmdClass.getDeclaredConstructor().newInstance();
+            Class<?> sessEnumClass = Class.forName("com.ford.dsp.domain.vehicle.services.DiagSessionInput$Session");
+            // Ford typo: "EXTENTED" not "EXTENDED" — preserved verbatim per the SDK.
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Object extSession = Enum.valueOf((Class) sessEnumClass, "EXTENTED_SESSION");
+            Method addReqM = diagSessCmdClass.getMethod("addModuleForSessionRequest", int.class, sessEnumClass);
+            addReqM.invoke(diagSessCmd, nodeAddress, extSession);
+
+            // Execute the session switch via the bridge-method form.
+            Method diagExecM = diagSessCmdClass.getMethod("execute", Object.class);
+            diagExecM.invoke(diagSessCmd, selftestSvc);
+            if (debugEnabled()) {
+                LOG.log(Level.INFO, "[readDID] retry: switched module 0x{0} to EXTENTED_SESSION; rerunning readDID",
+                    Integer.toHexString(nodeAddress).toUpperCase());
+            }
+
+            // Now retry the original readDID command — same cmd, same receiver service.
+            Object retryResult = readDIDExecMethod.invoke(cmd, readDIDService);
+            return retryResult;
+        } catch (Throwable t) {
+            if (debugEnabled()) {
+                LOG.log(Level.INFO, "[readDID] retry-with-extended-session threw: {0}: {1}",
+                    new Object[]{t.getClass().getSimpleName(), t.getMessage()});
+            }
+            return null;
         }
     }
 
