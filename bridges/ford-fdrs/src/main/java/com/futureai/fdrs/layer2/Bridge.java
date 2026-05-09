@@ -73,4 +73,19 @@ public class Bridge {
         }
         return null;
     }
+
+    /**
+     * Expose the OSGi BundleContext so adapters can look up arbitrary
+     * services that aren't CommandInvoker — e.g. ReadDIDAdapter needs
+     * the DIDCommsService receiver to pass into cmd.execute(service)
+     * because Ford's AbstractCommand.execute() takes the receiver as an
+     * argument (per javap: ReadDID.execute(DIDCommsService) throws ...).
+     *
+     * Adapters use this via Bridge.active().context() since the static
+     * accessor is the established pattern (see ReadDIDBatchAdapter for
+     * the prior precedent).
+     */
+    public BundleContext context() {
+        return ctx;
+    }
 }

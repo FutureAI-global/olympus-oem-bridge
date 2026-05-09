@@ -12,6 +12,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.ServiceReference;
+import com.futureai.fdrs.layer2.Bridge;
 
 /**
  * Wraps {@link ReadDID} for live per-module PID reads.
@@ -146,44 +149,69 @@ public final class ReadDIDAdapter implements CommandAdapter {
                 return Json.walkBean(result, 6);
             }
 
-            // Path 2 (Option β · 2026-05-09 Session N's Path-3-dump-driven fix):
-            // inv.invoke(cmd) silently dropped the return value. Bypass the
-            // OSGI invoker entirely and call cmd.execute() directly via
-            // reflection. ReadDID.execute() looks up DIDCommsService via the
-            // service registry, calls didCommsService.readDID(didNumber,
-            // nodeAddress), and returns the populated DID. The framework's
-            // invoke wrapper was the only thing dropping the return value.
+            // Path 2 (Option BETA v2 - 2026-05-09 - Session N Path-3 dump
+            // + javap-against-Ford finding):
             //
-            // Why this is safe: Command.execute() is part of the public Command
-            // interface (per AbstractCommand bytecode inspection). Constructor
-            // already wired didNumber + nodeAddress + service-handle. No
-            // additional framework state required for execute() to run.
+            // ReadDID.execute() takes ONE arg - the receiver service:
+            //   public DID execute(DIDCommsService) throws DIDCommsServiceException
+            //   public Object execute(Object) throws Exception   (bridge method post-erasure)
+            //
+            // The OSGI invoker normally handles service-resolve + execute(service)
+            // for the caller. inv.invoke(cmd) was returning null because the
+            // invoker doesn't auto-dispatch ReadDID this way. Real fix: look
+            // up DIDCommsService ourselves via the bundle's BundleContext
+            // (cmd.getReceiverType() gives us the interface Class), then call
+            // cmd.execute(service) reflectively. The bridge-method form
+            // (Object.class arg) always exists post-erasure so getMethod with
+            // Object.class is reliable across all Ford Command<R, T, E> subclasses.
             if (cmd != null) {
                 if (debugEnabled()) {
-                    LOG.info("[readDID] result=NULL from inv.invoke; trying cmd.execute() directly (Option β)");
+                    LOG.info("[readDID] result=NULL from inv.invoke; trying cmd.execute(receiverService)");
                 }
                 try {
-                    Method execMethod = cmd.getClass().getMethod("execute");
-                    Object directResult = execMethod.invoke(cmd);
-                    if (directResult != null) {
-                        if (debugEnabled()) {
-                            LOG.log(Level.INFO, "[readDID] cmd.execute() returned: {0}",
-                                directResult.getClass().getName());
+                    Method getRecvTypeM = cmd.getClass().getMethod("getReceiverType");
+                    Object rt = getRecvTypeM.invoke(cmd);
+                    Class<?> recvClass = (rt instanceof Class<?>) ? (Class<?>) rt : null;
+                    Object receiverService = null;
+                    String recvFqn = null;
+                    if (recvClass != null) {
+                        recvFqn = recvClass.getName();
+                        Bridge bridge = Bridge.active();
+                        if (bridge != null) {
+                            BundleContext bctx = bridge.context();
+                            if (bctx != null) {
+                                ServiceReference<?> ref = bctx.getServiceReference(recvFqn);
+                                if (ref != null) {
+                                    receiverService = bctx.getService(ref);
+                                }
+                            }
                         }
-                        return Json.walkBean(directResult, 6);
                     }
                     if (debugEnabled()) {
-                        LOG.info("[readDID] cmd.execute() also returned null; falling through to receiver-walk + diagnostic");
+                        LOG.log(Level.INFO, "[readDID] receiverType={0} receiverService={1}",
+                            new Object[]{recvFqn, receiverService == null ? "NULL" : receiverService.getClass().getName()});
+                    }
+                    if (receiverService != null) {
+                        Method execMethod = cmd.getClass().getMethod("execute", Object.class);
+                        Object directResult = execMethod.invoke(cmd, receiverService);
+                        if (directResult != null) {
+                            if (debugEnabled()) {
+                                LOG.log(Level.INFO, "[readDID] cmd.execute(service) returned: {0}",
+                                    directResult.getClass().getName());
+                            }
+                            return Json.walkBean(directResult, 6);
+                        }
+                        if (debugEnabled()) {
+                            LOG.info("[readDID] cmd.execute(service) returned null; falling through");
+                        }
+                    } else if (debugEnabled()) {
+                        LOG.info("[readDID] could not resolve receiver service from BundleContext; falling through");
                     }
                 } catch (Throwable t) {
                     if (debugEnabled()) {
-                        LOG.log(Level.INFO, "[readDID] cmd.execute() threw: {0}: {1}",
+                        LOG.log(Level.INFO, "[readDID] Option BETA v2 threw: {0}: {1}",
                             new Object[]{t.getClass().getSimpleName(), t.getMessage()});
                     }
-                    // Don't rethrow — fall through to the legacy receiver-walk
-                    // and structured diagnostic. Some Ford execute() impls
-                    // throw without context outside the framework; the
-                    // receiver-walk + diag path still gives us forensic value.
                 }
             }
 
