@@ -2,7 +2,7 @@ Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
 Bundle-Name: FutureAI FDRS Layer 2 Bridge
 Bundle-SymbolicName: com.futureai.fdrs.layer2
-Bundle-Version: 0.2.5
+Bundle-Version: 0.2.7
 Bundle-Vendor: FutureAI Inc
 Bundle-Description: Exposes allowlisted FDRS OSGi commands via localhost
  HTTP on port 18082 so Olympus can autonomously drive FDRS. Read-only
