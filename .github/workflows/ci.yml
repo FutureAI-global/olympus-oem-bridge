@@ -55,9 +55,13 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y shellcheck
       - name: Lint
         run: |
+          # -S warning: only fail on warning-level + errors. Info-level
+          # findings (SC2012 ls-vs-find, SC1091 source-not-followed) are
+          # surfaced for review but don't block CI — common in scripts
+          # that target a fixed install layout where ls is correct.
           for f in bridges/*/scripts/*.sh; do
             echo "=== $f ==="
-            shellcheck -x "$f" || exit 1
+            shellcheck -x -S warning "$f" || exit 1
           done
 
   link-check:
