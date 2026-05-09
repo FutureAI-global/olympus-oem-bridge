@@ -257,6 +257,54 @@ export function buildLayer2McpServer(
     },
   );
 
+  // ────────────────────────────────────────────────────────────────────
+  // Session lifecycle
+  //
+  // Stateful bundle commands (readDID, readDIDBatch, readSelfTestDTCs,
+  // streamPID-via-polling, vehicle_status) need a UDS session bootstrapped
+  // against the VIN before they return real data. Without a session the
+  // bundle accepts the call but returns `result: null` because there's
+  // no SelectedVehicle in VehicleService.
+  //
+  // Discovered by Session N's bench (2026-05-09): readDID returned null
+  // on both 1FTRF3AT4TEC85082 and 1FTER4FH8NLD22858 → not a VIN issue,
+  // a session-bootstrap-missing issue.
+  //
+  // Strategy: lazy-bootstrap on first stateful call per-VIN. Cache the
+  // sessionId for reuse. Drop + re-bootstrap on freshOnly:true so callers
+  // can force a fresh SelectVehicle (which is the actual semantics of
+  // "live UDS sweep" — re-establish the vehicle context, then read).
+  // ────────────────────────────────────────────────────────────────────
+
+  const sessionsByVin = new Map<string, string>();
+
+  async function ensureSession(vin: string, opts: { forceFresh?: boolean } = {}): Promise<string | undefined> {
+    if (typeof vin !== "string" || vin.length === 0) return undefined;
+    if (opts.forceFresh) {
+      const stale = sessionsByVin.get(vin);
+      sessionsByVin.delete(vin);
+      if (stale) {
+        // Best-effort release; never throws.
+        client.releaseSession(stale).catch(() => undefined);
+      }
+    }
+    const cached = sessionsByVin.get(vin);
+    if (cached) return cached;
+    try {
+      const r = await client.bootstrap(vin);
+      sessionsByVin.set(vin, r.sessionId);
+      log(`layer2-mcp: bootstrapped session ${r.sessionId.slice(0, 8)}... for ${vin.slice(0, 4)}...`);
+      return r.sessionId;
+    } catch (err) {
+      // Bootstrap failed (e.g. wrong VIN, FDRS Workshop instead of live).
+      // Surface as error in the calling tool result. ensureSession returns
+      // undefined so the call falls through to a session-less invoke,
+      // which will return null result that the caller can detect.
+      log(`layer2-mcp: bootstrap failed for vin=${vin}: ${(err as Error).message.slice(0, 120)}`);
+      return undefined;
+    }
+  }
+
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     log("layer2-mcp: tools/list");
     const tools: Tool[] = LAYER2_TOOL_NAMES.map((name) => ({
@@ -281,37 +329,66 @@ export function buildLayer2McpServer(
       switch (name) {
         case "module_inventory": {
           const freshOnly = args.freshOnly === true;
-          const inv = await client.invoke("getApplicationsAndSystems", {
-            forceRefresh: freshOnly,
-          });
-          // Honest source labeling per MUST-31. The bundle MAY echo a
-          // source field once D-3 lands JAR-side. Until then, when
-          // freshOnly was requested but the bundle didn't honor it,
-          // surface "unknown" rather than lying with "live-uds".
+          const vin = typeof args.vin === "string" ? args.vin : "";
+          // Bootstrap (or re-bootstrap on freshOnly) so the inventory
+          // reflects the current vehicle. The bundle's
+          // getApplicationsAndSystems is largely metadata about installed
+          // FDRS tools but its filtering depends on SelectedVehicle.
+          const sessionId = await ensureSession(vin, { forceFresh: freshOnly });
+          const inv = await client.invoke(
+            "getApplicationsAndSystems",
+            { forceRefresh: freshOnly },
+            sessionId,
+          );
           return successResult(inv, {
             vin: args.vin,
             requestedFresh: freshOnly,
+            sessionEstablished: !!sessionId,
           });
         }
-        case "self_test":
+        case "self_test": {
+          const sessionId = await ensureSession(
+            typeof args.vin === "string" ? args.vin : "",
+          );
           return successResult(
-            await client.invoke("readSelfTestDTCs", {
+            await client.invoke(
+              "readSelfTestDTCs",
+              {
+                module: args.module,
+                forceRefresh: args.forceRefresh === true,
+              },
+              sessionId,
+            ),
+            {
+              vin: args.vin,
               module: args.module,
-              forceRefresh: args.forceRefresh === true,
-            }),
-            { vin: args.vin, module: args.module },
+              sessionEstablished: !!sessionId,
+            },
           );
-        case "vehicle_history":
+        }
+        case "vehicle_history": {
+          const sessionId = await ensureSession(
+            typeof args.vin === "string" ? args.vin : "",
+          );
           return successResult(
-            await client.invoke("readVehicleHistory", {}),
-            { vin: args.vin },
+            await client.invoke("readVehicleHistory", {}, sessionId),
+            { vin: args.vin, sessionEstablished: !!sessionId },
           );
-        case "vehicle_status":
+        }
+        case "vehicle_status": {
+          // vehicle_status is the canonical "is the bundle in a good state"
+          // probe. Bootstrap so it reflects the live SelectedVehicle.
+          const sessionId = await ensureSession(
+            typeof args.vin === "string" ? args.vin : "",
+          );
           return successResult(
-            await client.invoke("getVehicleModelStatus", {}),
-            { vin: args.vin },
+            await client.invoke("getVehicleModelStatus", {}, sessionId),
+            { vin: args.vin, sessionEstablished: !!sessionId },
           );
+        }
         case "last_vehicles":
+          // Stateless — recent VIN list comes from FDRS session memory,
+          // not the active UDS bus.
           return successResult(
             await client.invoke("getLastSelectedVehicles", {}),
             {},
@@ -320,26 +397,63 @@ export function buildLayer2McpServer(
           return rawResult(await client.health());
         case "bridge_commands":
           return rawResult(await client.listCommands());
-        case "read_did":
-          return successResult(
-            await client.invoke("readDID", {
-              didNumber: args.didNumber,
-              nodeAddress: args.nodeAddress,
-            }),
-            { vin: args.vin },
+        case "read_did": {
+          const sessionId = await ensureSession(
+            typeof args.vin === "string" ? args.vin : "",
           );
-        case "read_did_batch":
+          if (!sessionId) {
+            return errorResult(
+              "read_did requires a UDS session; bootstrap failed for vin=" +
+                String(args.vin),
+            );
+          }
           return successResult(
-            await client.invoke("readDIDBatch", {
-              nodeAddress: args.nodeAddress,
-              dids: args.dids,
-            }),
-            { vin: args.vin },
+            await client.invoke(
+              "readDID",
+              {
+                didNumber: args.didNumber,
+                nodeAddress: args.nodeAddress,
+              },
+              sessionId,
+            ),
+            { vin: args.vin, sessionId },
           );
+        }
+        case "read_did_batch": {
+          const sessionId = await ensureSession(
+            typeof args.vin === "string" ? args.vin : "",
+          );
+          if (!sessionId) {
+            return errorResult(
+              "read_did_batch requires a UDS session; bootstrap failed for vin=" +
+                String(args.vin),
+            );
+          }
+          return successResult(
+            await client.invoke(
+              "readDIDBatch",
+              {
+                nodeAddress: args.nodeAddress,
+                dids: args.dids,
+              },
+              sessionId,
+            ),
+            { vin: args.vin, sessionId },
+          );
+        }
         case "stream_pid_window": {
           const r = validateStreamArgs(args);
           if (!r.ok) return errorResult(r.error);
-          return await runStreamPidWindow(client, r.parsed, log);
+          const sessionId = await ensureSession(
+            typeof r.parsed.vin === "string" ? r.parsed.vin : "",
+          );
+          if (!sessionId) {
+            return errorResult(
+              "stream_pid_window requires a UDS session; bootstrap failed for vin=" +
+                String(r.parsed.vin),
+            );
+          }
+          return await runStreamPidWindow(client, r.parsed, log, sessionId);
         }
       }
     } catch (err) {
@@ -478,6 +592,7 @@ async function runStreamPidWindow(
   client: FdrsLayer2Client,
   args: StreamPidArgs,
   log: (line: string) => void,
+  sessionId?: string,
 ): Promise<CallToolResult> {
   const intervalMs = Math.round(1000 / args.rateHz);
   const startMs = Date.now();
@@ -490,10 +605,14 @@ async function runStreamPidWindow(
     const tickStart = Date.now();
     let sample: PidSample;
     try {
-      const inv = await client.invoke("readDID", {
-        didNumber: args.didNumber,
-        nodeAddress: args.nodeAddress,
-      });
+      const inv = await client.invoke(
+        "readDID",
+        {
+          didNumber: args.didNumber,
+          nodeAddress: args.nodeAddress,
+        },
+        sessionId,
+      );
       const latencyMs = Date.now() - tickStart;
       if (inv.ok) {
         sample = { t: tickStart, latencyMs, result: inv.result };
