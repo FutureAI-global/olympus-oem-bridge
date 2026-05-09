@@ -146,20 +146,63 @@ public final class ReadDIDAdapter implements CommandAdapter {
                 return Json.walkBean(result, 6);
             }
 
-            // Path 2: invoke() returned null. Try to recover from cmd state.
-            // Ford's AbstractCommand uses receiver-pattern result delivery —
-            // the populated receiver is reachable via the cmd's getters.
+            // Path 2 (Option β · 2026-05-09 Session N's Path-3-dump-driven fix):
+            // inv.invoke(cmd) silently dropped the return value. Bypass the
+            // OSGI invoker entirely and call cmd.execute() directly via
+            // reflection. ReadDID.execute() looks up DIDCommsService via the
+            // service registry, calls didCommsService.readDID(didNumber,
+            // nodeAddress), and returns the populated DID. The framework's
+            // invoke wrapper was the only thing dropping the return value.
+            //
+            // Why this is safe: Command.execute() is part of the public Command
+            // interface (per AbstractCommand bytecode inspection). Constructor
+            // already wired didNumber + nodeAddress + service-handle. No
+            // additional framework state required for execute() to run.
             if (cmd != null) {
                 if (debugEnabled()) {
-                    LOG.info("[readDID] result=NULL; scanning cmd for receiver-bound result");
+                    LOG.info("[readDID] result=NULL from inv.invoke; trying cmd.execute() directly (Option β)");
+                }
+                try {
+                    Method execMethod = cmd.getClass().getMethod("execute");
+                    Object directResult = execMethod.invoke(cmd);
+                    if (directResult != null) {
+                        if (debugEnabled()) {
+                            LOG.log(Level.INFO, "[readDID] cmd.execute() returned: {0}",
+                                directResult.getClass().getName());
+                        }
+                        return Json.walkBean(directResult, 6);
+                    }
+                    if (debugEnabled()) {
+                        LOG.info("[readDID] cmd.execute() also returned null; falling through to receiver-walk + diagnostic");
+                    }
+                } catch (Throwable t) {
+                    if (debugEnabled()) {
+                        LOG.log(Level.INFO, "[readDID] cmd.execute() threw: {0}: {1}",
+                            new Object[]{t.getClass().getSimpleName(), t.getMessage()});
+                    }
+                    // Don't rethrow — fall through to the legacy receiver-walk
+                    // and structured diagnostic. Some Ford execute() impls
+                    // throw without context outside the framework; the
+                    // receiver-walk + diag path still gives us forensic value.
+                }
+            }
+
+            // Path 3 (legacy fallback · pre-Session-N dump): invoke() returned
+            // null and execute() didn't help. Try to recover from cmd state by
+            // walking getters whose return type matches getReceiverType().
+            // This was the original hypothesis before N's bench dump showed
+            // ReadDID's receiverType is a SERVICE INTERFACE (DIDCommsService)
+            // not the result type, so this path will typically find nothing
+            // for ReadDID — but kept for adapters that DO use the constructor-
+            // arg-receiver pattern (ReadAllCMDTCs-style).
+            if (cmd != null) {
+                if (debugEnabled()) {
+                    LOG.info("[readDID] scanning cmd getters for receiver-bound result (legacy fallback)");
                     for (String line : reflectGetters(cmd, "cmd")) {
                         LOG.info(line);
                     }
                 }
 
-                // Look for a getter on cmd whose return type matches the
-                // declared receiver type (cmd.getReceiverType() returns
-                // Class<?> of the result type for receiver-pattern commands).
                 Class<?> recvType = null;
                 try {
                     Method getRecvType = cmd.getClass().getMethod("getReceiverType");

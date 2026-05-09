@@ -18,11 +18,6 @@
 #   - Remove prior versions of this bundle (caller's responsibility via --replace)
 set -euo pipefail
 
-# Default USER if unset — Git Bash on Windows does not auto-export it,
-# which trips `set -u` at the FDRS_RUNTIME_LOG line below. Caught on
-# McGraw bench 2026-05-09 by Session N.
-: "${USER:=$(whoami)}"
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FDRS_BUNDLE_DIR="/c/Program Files (x86)/Ford Motor Company/FDRS/bundle"
 FDRS_RUNTIME_LOG="/c/Users/$USER/.olympus/fdrs/fdrs-runtime.log"
@@ -51,6 +46,27 @@ fi
 
 echo ">>> Copying $JAR_NAME into FDRS bundle/"
 cp -v "$JAR_PATH" "$DEST"
+
+# Felix bundle cache invalidation — without this, swapping the JAR is a
+# no-op because Felix loads the cached classes from before the swap.
+# Caught on McGraw bench 2026-05-09 by Session N: a JAR with the
+# receiver-pattern fix deployed cleanly but produced the same null result
+# as the pre-fix version because Felix held the old class graph in
+# %PROGRAMDATA%\Ford Motor Company\FDRS\fdrs\felix-cache\.
+#
+# We try the standard Windows path; if not present, the find command
+# below catches non-default install layouts.
+FELIX_CACHE="/c/ProgramData/Ford Motor Company/FDRS/fdrs/felix-cache"
+if [[ -d "$FELIX_CACHE" ]]; then
+  echo ">>> Clearing Felix bundle cache at $FELIX_CACHE"
+  rm -rf "$FELIX_CACHE"/* 2>/dev/null || {
+    echo "WARN: could not fully clear Felix cache (may need admin)." >&2
+    echo "     Manual: del /S /Q \"%PROGRAMDATA%\\Ford Motor Company\\FDRS\\fdrs\\felix-cache\\*\"" >&2
+  }
+else
+  echo ">>> Felix cache not at expected path; if FDRS still loads stale class:" >&2
+  echo "    look for *fdrs*felix-cache* under %PROGRAMDATA% and clear manually" >&2
+fi
 
 cat <<EOF
 
