@@ -109,7 +109,10 @@ public final class ReadDIDBatchAdapter implements CommandAdapter {
         }
         // Stash the plan so serializeResult can re-execute the batch.
         BATCH_PLAN.set(new BatchPlan(nodeAddress, dids));
-        return new ReadDID(dids.get(0), nodeAddress);
+        // Ford's ReadDID constructor is (nodeAddress, didNumber) — see
+        // ReadDIDAdapter for the empirical bench evidence (PR #2484
+        // comment 4413717722).
+        return new ReadDID(nodeAddress, dids.get(0));
     }
 
     /**
@@ -150,7 +153,9 @@ public final class ReadDIDBatchAdapter implements CommandAdapter {
             for (int i = 1; i < plan.dids.size(); i++) {
                 int did = plan.dids.get(i);
                 try {
-                    Object result = invoker.invoke(new ReadDID(did, plan.nodeAddress));
+                    // Ford's ReadDID constructor is (nodeAddress, didNumber);
+                    // see ReadDIDAdapter for empirical bench evidence.
+                    Object result = invoker.invoke(new ReadDID(plan.nodeAddress, did));
                     reads.add(wrapReadResult(did, result, null));
                 } catch (Exception err) {
                     reads.add(wrapReadResult(did, null, err));
