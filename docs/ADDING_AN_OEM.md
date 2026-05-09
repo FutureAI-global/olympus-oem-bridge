@@ -106,6 +106,46 @@ Porsche's PIWIS 3 runs on Windows as a Java Swing application. It uses an intern
 
 After merge, the same MCP server pattern that today drives FDRS would drive PIWIS — same wire shape, different bundle URL.
 
+## Gotcha · receiver-pattern result delivery (Ford / OTX-style stacks)
+
+Ford's OSGi command framework uses a **receiver pattern** for result delivery — the same pattern any stack derived from OTX (Open Test Exchange, ISO 13209) is likely to follow. If you wrap your OEM's commands naively assuming `invoker.invoke(cmd)` returns the result, you may hit a silent-null trap.
+
+**The pattern:**
+
+```
+Command.getReceiverType()              → Class<?> of expected result
+CommandInvoker.registerReceiver(cmd)   → creates + binds receiver
+CommandInvoker.invoke(cmd)             → populates receiver via execute()
+CommandInvoker.deregisterReceiver(cmd) → cleanup
+```
+
+Two variants in the wild:
+
+1. **Receiver-as-constructor-arg** — caller passes the receiver in. `invoke(cmd)` populates it, returns it. Naive code works. Example: Ford's `ReadAllCMDTCs(boolean forceRefresh, DTCList receiver)`.
+2. **Auto-receiver** — no receiver in constructor. Framework auto-binds via `getReceiverType()`. **`invoke(cmd)` returns null.** The result lives on the cmd post-execute, reachable via reflection. Example: Ford's `ReadDID(int didNumber, int nodeAddress)` — no receiver arg, result hangs off cmd.
+
+**If you're seeing all-null results from a `Read*` command:**
+
+1. Class-file decompile the command + check whether `receiver` is in the constructor or absent.
+2. If absent, your serialize code needs a fallback that walks the cmd's getters post-invoke and finds the value matching `cmd.getReceiverType()`.
+
+Reference impl: [`bridges/ford-fdrs/src/main/java/com/futureai/fdrs/layer2/adapter/ReadDIDAdapter.java`](../bridges/ford-fdrs/src/main/java/com/futureai/fdrs/layer2/adapter/ReadDIDAdapter.java) — has a 3-path fallback in `serializeResult`:
+
+```java
+public Object serializeResult(Object result) {
+  // Path 1: invoke returned a real value (constructor-arg-receiver path)
+  if (result != null) return Json.walkBean(result, 6);
+  // Path 2: auto-receiver — recover from cmd state
+  Class<?> recvType = (Class<?>) cmd.getClass().getMethod("getReceiverType").invoke(cmd);
+  Object recovered = findReceiverValue(cmd, recvType);
+  if (recovered != null) return Json.walkBean(recovered, 6);
+  // Path 3: structured diagnostic so consumers can see WHY null
+  return diagnosticDump(cmd);
+}
+```
+
+Adopt the same shape for any OEM bridge using a receiver-pattern dispatcher (Ford OTX, BMW ISTA-D OTX, some Mercedes XENTRY versions).
+
 ## Help
 
 Questions, stuck on Step 2, or want a sanity check before opening a PR? Open an issue on this repo with the OEM tool name + what you've found so far. Other contributors who've done bridges for similar runtimes can advise.
