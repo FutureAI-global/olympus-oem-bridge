@@ -1,0 +1,12 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+# MARK: 1 — set your bundle's symbolic name (com.<org>.<oem>.bridge.layer2)
+Bundle-SymbolicName: com.example.oem.bridge.layer2
+# MARK: 2 — bump on every release
+Bundle-Version: 0.0.1
+# MARK: 3 — point at your Activator class (must match the .java package)
+Bundle-Activator: com.example.oem.bridge.layer2.Activator
+Bundle-RequiredExecutionEnvironment: JavaSE-17
+# OSGi R6 Import-Package range — should match what FDRS/your OEM tool ships.
+# The Ford-FDRS reference impl uses [1.6,2.0) which works on Felix.
+Import-Package: org.osgi.framework;version="[1.6,2.0)"

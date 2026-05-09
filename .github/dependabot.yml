@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # MCP TypeScript dependencies. Weekly so security patches land fast
+  # without flooding contributors with chore PRs.
+  - package-ecosystem: npm
+    directory: /mcp
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - mcp
+    reviewers:
+      - FutureAI-global/maintainers
+
+  # GitHub Actions versions (the ci.yml workflow). Monthly is enough —
+  # action major-bumps are infrequent and break-prone.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+      - ci
+    reviewers:
+      - FutureAI-global/maintainers

@@ -1,0 +1,27 @@
+# CODEOWNERS for olympus-oem-bridge.
+#
+# Routing rules:
+#   - Bridge code per-OEM is owned by whoever shipped that bridge. They
+#     review their own bridge's PRs by default. Other reviewers are
+#     welcome but not required.
+#   - The MCP layer + the docs are maintained by the FutureAI org since
+#     the protocol affects every bridge.
+#   - The _template scaffold is FutureAI-maintained — changes here ripple
+#     to every contributor's starting point.
+
+# Default: org maintainers
+*               @FutureAI-global/maintainers
+
+# MCP layer + protocol docs
+/mcp/                       @FutureAI-global/maintainers
+/docs/                      @FutureAI-global/maintainers
+/CONTRIBUTING.md            @FutureAI-global/maintainers
+/SECURITY.md                @FutureAI-global/maintainers
+
+# Per-OEM bridges — additional reviewers as bridges land. The Ford-FDRS
+# reference is org-maintained; new OEM bridges land with their author
+# auto-added here.
+/bridges/ford-fdrs/         @FutureAI-global/maintainers
+
+# Template scaffold — affects every future bridge author
+/bridges/_template/         @FutureAI-global/maintainers
