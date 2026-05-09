@@ -13,7 +13,7 @@ jobs:
       run:
         working-directory: mcp
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -52,7 +52,7 @@ jobs:
     name: Bridge build scripts shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install shellcheck
         run: sudo apt-get update -y && sudo apt-get install -y shellcheck
       - name: Lint
@@ -70,7 +70,7 @@ jobs:
     name: Doc link integrity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Verify internal cross-references
         run: |
           # All ./ relative links in docs/ + READMEs must resolve to existing paths.
