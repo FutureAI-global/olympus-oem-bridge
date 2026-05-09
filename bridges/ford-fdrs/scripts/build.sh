@@ -22,8 +22,14 @@ JDK="$FDRS/3rdParty/java17/bin"
 # means an unexpected install state we'd rather fail than guess.
 resolve_one() {
   local pattern="$1"
-  # shellcheck disable=SC2207  # intentional split on filenames (no spaces in Ford paths)
-  local matches=( $(compgen -G "$pattern" || true) )
+  # mapfile (vs `( $(compgen -G ...) )`) preserves paths with spaces — the
+  # FDRS install path on Windows is `C:\Program Files (x86)\Ford Motor
+  # Company\FDRS` which the array-split form mistakenly tokenized as
+  # multiple matches. Caught on McGraw bench 2026-05-09 by Session N.
+  # The original "(no spaces in Ford paths)" comment is empirically wrong
+  # for the actual install layout.
+  local matches=()
+  mapfile -t matches < <(compgen -G "$pattern" || true)
   if [[ ${#matches[@]} -eq 0 ]]; then
     echo "ERROR: no JAR matches pattern: $pattern" >&2
     echo "       Is FDRS installed at the expected path?" >&2

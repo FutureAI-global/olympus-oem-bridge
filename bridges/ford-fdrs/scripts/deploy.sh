@@ -18,6 +18,11 @@
 #   - Remove prior versions of this bundle (caller's responsibility via --replace)
 set -euo pipefail
 
+# Default USER if unset — Git Bash on Windows does not auto-export it,
+# which trips `set -u` at the FDRS_RUNTIME_LOG line below. Caught on
+# McGraw bench 2026-05-09 by Session N.
+: "${USER:=$(whoami)}"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FDRS_BUNDLE_DIR="/c/Program Files (x86)/Ford Motor Company/FDRS/bundle"
 FDRS_RUNTIME_LOG="/c/Users/$USER/.olympus/fdrs/fdrs-runtime.log"
