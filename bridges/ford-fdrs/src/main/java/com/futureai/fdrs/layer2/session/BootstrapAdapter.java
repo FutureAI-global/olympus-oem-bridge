@@ -3,9 +3,11 @@ package com.futureai.fdrs.layer2.session;
 import com.ford.otx.command.invoker.CommandInvoker;
 import com.ford.otx.services.user.command.LoginUser;
 import com.ford.otx.services.vehicle.command.SelectVehicle;
+import com.ford.otx.services.vehicle.comms.command.ReadDID;
 import com.futureai.fdrs.layer2.Bridge;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -82,6 +84,31 @@ public final class BootstrapAdapter {
 
         invoker.invoke(new SelectVehicle(vin));
 
+        // Cold-start warm-up. Ford's diagnostic session needs a no-op
+        // tester-present read to settle before the first user-facing
+        // readDID will return populated. N's bench (PR #2484 comment
+        // 4413851004) showed the FIRST readDID after SelectVehicle can
+        // return null even on known-safe (module, DID) pairs, while the
+        // SECOND read on the same pair succeeds. Discarded warm-up read
+        // here makes first-call deterministic.
+        //
+        // Best-effort. If the warm-up read fails for any reason we still
+        // report bootstrap success and the user's first read just hits
+        // the same cold-start condition we were trying to avoid; we
+        // don't want a transient warm-up failure to take down session
+        // establishment.
+        //
+        // Choice of (BCM 0x726, VIN 0xF190): empirically validated
+        // present on Ranger 2022 + most Ford configurations. VIN is a
+        // global identifier every Ford module exposes via BCM.
+        boolean warmupOk = false;
+        try {
+            Object warmup = invoker.invoke(new ReadDID(0x726, 0xF190));
+            warmupOk = warmup != null;
+        } catch (Throwable t) {
+            LOG.log(Level.FINE, "bootstrap warmup readDID threw (ignored): {0}", t.getMessage());
+        }
+
         String sessionId = sessions.createSession();
         SessionManager.SessionState s = sessions.acquire(sessionId);
         try {
@@ -90,13 +117,14 @@ public final class BootstrapAdapter {
             sessions.release(s);
         }
         LOG.info("bootstrap ok: sessionId=" + sessionId + " vin=" + vin
-            + " authenticated=" + authenticated);
+            + " authenticated=" + authenticated + " warmup=" + warmupOk);
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
         out.put("sessionId", sessionId);
         out.put("vin", vin);
         out.put("authenticated", authenticated);
+        out.put("warmup", warmupOk);
         out.put("latencyMs", System.currentTimeMillis() - t0);
         return out;
     }
