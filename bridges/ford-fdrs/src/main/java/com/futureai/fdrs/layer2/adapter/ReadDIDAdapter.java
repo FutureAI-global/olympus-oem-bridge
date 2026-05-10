@@ -121,7 +121,16 @@ public final class ReadDIDAdapter implements CommandAdapter {
     public Command<?, ?, ?> make(Map<String, Object> args) {
         int didNumber = coerceInt(args, "didNumber");
         int nodeAddress = coerceInt(args, "nodeAddress");
-        Command<?, ?, ?> cmd = new ReadDID(didNumber, nodeAddress);
+        // Ford's ReadDID constructor signature is (nodeAddress, didNumber) —
+        // NOT (didNumber, nodeAddress). javap shows ReadDID(int, int) without
+        // parameter names, so the order has to be confirmed empirically. N's
+        // bench (PR #2484 comment 4413717722) found the swap: passing
+        // (didNumber, nodeAddress) made the bus read "DID 0x7E0 from module
+        // 0xF190" — module 0xF190 doesn't exist on Ranger so the read silently
+        // returned null. All 6 prior forensic layers (receiver-pattern walk,
+        // execute(service) bypass, extended-diag-session, manifest imports)
+        // were chasing this single arg-order bug.
+        Command<?, ?, ?> cmd = new ReadDID(nodeAddress, didNumber);
         LAST_CMD.set(cmd);
         if (debugEnabled()) {
             LOG.log(Level.INFO, "[readDID] make: didNumber=0x{0} ({1}), nodeAddress=0x{2} ({3}), cmd.class={4}",
@@ -201,11 +210,15 @@ public final class ReadDIDAdapter implements CommandAdapter {
                             }
                             return Json.walkBean(directResult, 6);
                         }
-                        // v3: null return after real bus traffic (~975ms on N's bench) is
-                        // the signature of UDS 0x22 NRC because the ECU is in default
-                        // diagnostic session. Escalate to EXTENTED_SESSION via
-                        // DiagSessionCommand and retry. Reflection-based so the bundle
-                        // does not need new Import-Package entries for com.ford.dsp.domain.*.
+                        // v4 (2026-05-09): N's bench (PR #2484 comment 4413750097)
+                        // proved the extended-diag-session retry is INDEPENDENTLY
+                        // load-bearing - not just an artifact of the args-order
+                        // bug. With args correct, PCM (0x7E0) still rejects DID
+                        // 0xF190 reads in default diag session. Escalate to UDS
+                        // 0x10 type 03 (EXTENTED_SESSION) via DiagSessionCommand,
+                        // then retry cmd.execute. Reflection-based so the bundle
+                        // does not need new Import-Package entries beyond what
+                        // PR #2530 already added.
                         Object retryResult = retryWithExtendedSession(cmd, receiverService, execMethod);
                         if (retryResult != null) {
                             if (debugEnabled()) {
@@ -299,21 +312,27 @@ public final class ReadDIDAdapter implements CommandAdapter {
     }
 
     /**
-     * v3: switch the target module to EXTENTED_SESSION (UDS 0x10 type 03)
+     * v4: switch the target module to EXTENTED_SESSION (UDS 0x10 type 03)
      * via Ford's DiagSessionCommand, then retry cmd.execute(receiverService).
-     * Uses reflection so the bundle manifest does not have to add Import-
-     * Package entries for com.ford.dsp.domain.vehicle.services.* — those
-     * classes are loaded at runtime from the Felix classpath when the
-     * bundle is already running inside FDRS.
+     * Uses reflection so the bundle manifest does not have to add new
+     * Import-Package entries beyond PR #2530's dsp.domain.* entries.
      *
      * Returns the populated DID on success, null if any step in the
      * session-escalation chain failed (in which case caller falls through
      * to the structured diagnostic dump).
+     *
+     * Independent of the constructor-arg-order fix (#2531). Both are
+     * required for the readDID happy path against PCM (0x7E0) - args
+     * correctness ensures we ask the RIGHT module for the RIGHT DID; the
+     * extended-session retry ensures the RIGHT module ANSWERS the read
+     * (most secured DIDs require UDS 0x10 type 03 elevation first).
      */
     private static Object retryWithExtendedSession(Command<?, ?, ?> cmd, Object readDIDService, Method readDIDExecMethod) {
         try {
-            // Resolve nodeAddress from cmd's private field — it was set
-            // by the constructor and is needed for addModuleForSessionRequest.
+            // Resolve nodeAddress from cmd's private field - set by
+            // constructor, needed for addModuleForSessionRequest. Note: cmd
+            // was constructed with (nodeAddress, didNumber) per PR #2531
+            // arg-swap fix, so the field name "nodeAddress" maps correctly.
             int nodeAddress;
             try {
                 java.lang.reflect.Field naField = cmd.getClass().getDeclaredField("nodeAddress");
@@ -324,7 +343,7 @@ public final class ReadDIDAdapter implements CommandAdapter {
                 return null;
             }
 
-            // Look up SelftestService — the receiver for DiagSessionCommand.
+            // Look up SelftestService - the receiver for DiagSessionCommand.
             Bridge bridge = Bridge.active();
             if (bridge == null) return null;
             BundleContext bctx = bridge.context();
@@ -343,7 +362,7 @@ public final class ReadDIDAdapter implements CommandAdapter {
             Class<?> diagSessCmdClass = Class.forName("com.ford.dsp.domain.vehicle.services.DiagSessionCommand");
             Object diagSessCmd = diagSessCmdClass.getDeclaredConstructor().newInstance();
             Class<?> sessEnumClass = Class.forName("com.ford.dsp.domain.vehicle.services.DiagSessionInput$Session");
-            // Ford typo: "EXTENTED" not "EXTENDED" — preserved verbatim per the SDK.
+            // Ford typo: "EXTENTED" not "EXTENDED" - preserved verbatim per the SDK.
             @SuppressWarnings({"unchecked", "rawtypes"})
             Object extSession = Enum.valueOf((Class) sessEnumClass, "EXTENTED_SESSION");
             Method addReqM = diagSessCmdClass.getMethod("addModuleForSessionRequest", int.class, sessEnumClass);
@@ -357,7 +376,7 @@ public final class ReadDIDAdapter implements CommandAdapter {
                     Integer.toHexString(nodeAddress).toUpperCase());
             }
 
-            // Now retry the original readDID command — same cmd, same receiver service.
+            // Now retry the original readDID command - same cmd, same receiver service.
             Object retryResult = readDIDExecMethod.invoke(cmd, readDIDService);
             return retryResult;
         } catch (Throwable t) {
